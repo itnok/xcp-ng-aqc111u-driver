@@ -1,0 +1,31 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+# NOT top-most EditorConfig file
+# _(to allow search to coninue down the tree)_
+root = false
+
+# Unix-style newlines with a newline ending every file and no trailing spaced on each line
+[*]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{c,h,cpp,hpp}]
+indent_size = 2
+
+[*.py]
+indent_size = 4
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.{js,json}]
+indent_size = 2
+
+[Makefile]
+indent_size = tab
+indent_style = tab
+
