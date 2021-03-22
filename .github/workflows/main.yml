@@ -1,0 +1,183 @@
+# This is a GitHub Actions Workflow for Build & Release
+
+name: CI
+
+# Controls when the action will run. 
+on:
+  # Triggers the workflow on push or pull request events but only for the master branch
+  push:
+    branches:
+      - "master"
+    tags:
+      - "**"
+
+  pull_request:
+    branches:
+      - "master"
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+env:
+  XCP_NG_BUILD_ENV_REPO_NAME: xcp-ng/xcp-ng-build-env
+  XCP_NG_BUILD_ENV_DIR_NAME: xcp-ng-build-env
+  XCP_NG_PKG_NAME: aqc111u-driver
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a three jobs called "setup", "build" and "release"
+  setup:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Define a matrix of values to be tested/executed
+    strategy:
+      matrix:
+        XCP_NG_VERSION: ["8.0", "8.1", "8.2"]
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: "Set REPO_DIR_NAME in env"
+        run: echo "REPO_DIR_NAME=$(basename ${GITHUB_WORKSPACE})" >> ${GITHUB_ENV}
+
+      # Check-out the XCP-ng Containerized Build Environment repository under $GITHUB_WORKSPACE, so the job can access it
+      - name: "Clone '${{ env.XCP_NG_BUILD_ENV_REPO_NAME }}' repository"
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ env.XCP_NG_BUILD_ENV_REPO_NAME }}
+          path: ${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}
+          clean: false
+          submodules: recursive
+          lfs: true
+
+      - name: "Patch XCP-ng build environment Dockerfiles to use the current CI user uid/gid"
+        run: >
+          ls Dockerfile* |
+          xargs -I %%%% sed -i
+          's~RUN *useradd builder~RUN groupadd -g '"$(id -g)"' builder \&\& useradd -u '"$(id -u)"' -g '"$(id -g)"' builder~g'
+          %%%%
+        working-directory: ./${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}
+
+      - name: "Build the development container for XCP-ng ${{ matrix.XCP_NG_VERSION }}"
+        run: ./build.sh ${{ matrix.XCP_NG_VERSION }}
+        working-directory: ./${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}
+        
+      - name: "Store ${{ env.XCP_NG_BUILD_ENV_REPO_NAME }}:${{ matrix.XCP_NG_VERSION }} container image"
+        run: >
+          docker save ${{ env.XCP_NG_BUILD_ENV_REPO_NAME }}:${{ matrix.XCP_NG_VERSION }}
+          -o /tmp/${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}.tar
+
+      - name: "Upload container image as artifact"
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}
+          path: /tmp/${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}.tar
+          
+  build:
+    needs: setup
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Define a matrix of values to be tested/executed
+    strategy:
+      matrix:
+        XCP_NG_VERSION: ["8.0", "8.1", "8.2"]
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: "Set REPO_DIR_NAME in env"
+        run: echo "REPO_DIR_NAME=$(basename ${GITHUB_WORKSPACE})" >> ${GITHUB_ENV}
+
+      # Checks-out the current repository under $GITHUB_WORKSPACE, so the job can access it
+      - name: "Clone '${{ github.repository }}' repository"
+        uses: actions/checkout@v2
+        with:
+          path: ./${{ env.REPO_DIR_NAME }}
+          clean: true
+          submodules: recursive
+          lfs: true
+
+      - name: "Download container images from previous 'setup' job"
+        uses: actions/download-artifact@v2
+        with:
+          name: ${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}
+          path: /tmp
+
+      - name: "Load container images"
+        run: >
+          docker load 
+          --input /tmp/${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}.tar
+
+      - name: "Extract expected package version from SPECS file"
+        run: echo "XCP_NG_PKG_VERSION=$(cat ./SPECS/*.spec | awk '/Version/ {print $2}')" >> ${GITHUB_ENV}        
+        working-directory: ./${{ env.REPO_DIR_NAME }}
+
+      - name: "Build the custom '${{ env.XCP_NG_PKG_NAME }}' RPM package for XCP-ng ${{ matrix.XCP_NG_VERSION }}"
+        # Equivalent to the command:
+        # ```
+        #   $ ${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}/run.py -b ${{ matrix.XCP_NG_VERSION }} --build-local ${REPO_DIR_NAME}/ --rm
+        # ```
+        # but here that repo is not pulled anymore, therefore the barebones docker command is used instead.
+        run: >
+          docker run
+          -t -u
+          builder
+          --rm=true
+          -v $(pwd)/${REPO_DIR_NAME}:/home/builder/rpmbuild
+          -e BUILD_LOCAL=1
+          -e RPMBUILD_DEFINE="release ${GITHUB_RUN_NUMBER}.xcpng${{ matrix.XCP_NG_VERSION }}"
+          xcp-ng/xcp-ng-build-env:${{ matrix.XCP_NG_VERSION }}
+          /usr/local/bin/init-container.sh
+
+      - name: "Publish '${{ env.XCP_NG_PKG_NAME }}' v${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }} RPM packages as build artifact"
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ env.XCP_NG_PKG_NAME }}-${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }}.x86_64.rpm
+          path: ./${{ env.REPO_DIR_NAME }}/RPMS/x86_64/${{ env.XCP_NG_PKG_NAME }}-${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }}.x86_64.rpm
+          if-no-files-found: error
+
+      - name: "Publish '${{ env.XCP_NG_PKG_NAME }}' v${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }} RPM packages (with debug symbols) as build artifact"
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ env.XCP_NG_PKG_NAME }}-debuginfo-${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }}.x86_64.rpm
+          path: ./${{ env.REPO_DIR_NAME }}/RPMS/x86_64/${{ env.XCP_NG_PKG_NAME }}-debuginfo-${{ env.XCP_NG_PKG_VERSION }}-${{ github.run_number }}.xcpng${{ matrix.XCP_NG_VERSION }}.x86_64.rpm
+          if-no-files-found: error
+
+      # delete artifacts no more needed to avoid incurring in unnecessary costs
+      - uses: geekyeggo/delete-artifact@v1
+        with:
+          name: ${{ env.XCP_NG_BUILD_ENV_DIR_NAME }}_${{ matrix.XCP_NG_VERSION }}
+    
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') == true
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: "Download RPM packages from previous 'build' job"
+        uses: actions/download-artifact@v2
+
+      - name: "Extract tag name from ${{ github.ref }}"
+        id: tag
+        run: echo ::set-output name=VERSION::$(echo ${GITHUB_REF} | cut -d/ -f3)
+
+      - name: "Create new release for ${{ steps.tag.outputs.VERSION }}"
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          name: Release ${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}
+          tag_name: ${{ github.ref }}
+          body: "..."
+          draft: false
+          prerelease: false
+          files: |
+            ${{ env.XCP_NG_PKG_NAME }}-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.0.x86_64.rpm
+            ${{ env.XCP_NG_PKG_NAME }}-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.1.x86_64.rpm
+            ${{ env.XCP_NG_PKG_NAME }}-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.2.x86_64.rpm
+            ${{ env.XCP_NG_PKG_NAME }}-debuginfo-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.0.x86_64.rpm
+            ${{ env.XCP_NG_PKG_NAME }}-debuginfo-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.1.x86_64.rpm
+            ${{ env.XCP_NG_PKG_NAME }}-debuginfo-${{ steps.tag.outputs.VERSION }}-${{ github.run_number }}.xcpng8.2.x86_64.rpm
+
